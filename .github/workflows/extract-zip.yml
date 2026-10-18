@@ -1,0 +1,85 @@
+name: Extract ZIP into repository
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_name:
+        description: 'ZIP filename in the repository root'
+        required: true
+        default: 'OMID-3x-ui-AutoSync.zip'
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: extract-zip
+  cancel-in-progress: false
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract all files, including dotfiles, and remove ZIP
+        shell: bash
+        env:
+          ZIP_NAME: ${{ inputs.zip_name }}
+        run: |
+          set -euo pipefail
+
+          # Accept only a ZIP filename in the repository root.
+          if [[ -z "$ZIP_NAME" || "$ZIP_NAME" == */* || "$ZIP_NAME" != *.zip ]]; then
+            echo "Input must be a .zip filename in the repository root, not a path."
+            exit 1
+          fi
+          if [[ ! -f "$ZIP_NAME" ]]; then
+            echo "ZIP not found: $ZIP_NAME"
+            echo "ZIP files available in repository root:"
+            find . -maxdepth 1 -type f -name '*.zip' -printf '  %f\n' | sort || true
+            exit 1
+          fi
+
+          # Reject unsafe archive paths before extraction.
+          python3 - "$ZIP_NAME" <<'PY'
+          import sys, zipfile
+          from pathlib import PurePosixPath
+
+          archive = sys.argv[1]
+          with zipfile.ZipFile(archive) as zf:
+              for entry in zf.infolist():
+                  name = entry.filename.replace('\\', '/')
+                  path = PurePosixPath(name)
+                  if name.startswith('/') or any(part == '..' for part in path.parts):
+                      raise SystemExit(f"Unsafe path in ZIP: {entry.filename}")
+          PY
+
+          # unzip includes dotfiles (.github, .gitignore, etc.) automatically.
+          # Exclude .git metadata so the archive cannot overwrite this repository's Git database.
+          unzip -o "$ZIP_NAME" -d . -x '.git' '.git/*' '*/.git' '*/.git/*'
+
+          # Delete the uploaded ZIP after successful extraction.
+          rm -- "$ZIP_NAME"
+
+      - name: Commit and push extracted files
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Stage all extracted content, including ignored dotfiles, and the ZIP deletion.
+          git add -A
+          git add -f -- .
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git commit -m "Extract ZIP archive and remove ZIP"
+          git push
