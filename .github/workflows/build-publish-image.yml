@@ -1,10 +1,12 @@
-name: Sync Sanaei upstream and publish OMID image
+
+name: Sync Sanaei Upstream and Publish OMID Image
 
 on:
   push:
-    branches: [main]
+    branches:
+      - "**"
   schedule:
-    - cron: '17 4 * * *'
+    - cron: "17 4 * * *"
   workflow_dispatch:
 
 permissions:
@@ -18,34 +20,61 @@ concurrency:
 jobs:
   sync-and-build:
     runs-on: ubuntu-24.04
+
     steps:
       - name: Checkout OMID repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: true
+
+      - name: Prepare image name
+        id: image
+        shell: bash
+        run: |
+          OWNER="$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
+          REPO="$(printf '%s' "${GITHUB_REPOSITORY#*/}" | tr '[:upper:]' '[:lower:]')"
+          echo "name=ghcr.io/${OWNER}/${REPO}" >> "$GITHUB_OUTPUT"
 
       - name: Checkout latest Sanaei source
-        run: git clone --depth 1 --branch main https://github.com/MHSanaei/3x-ui.git "$RUNNER_TEMP/omid-upstream"
+        env:
+          UPSTREAM_REPO: MHSanaei/3x-ui
+          UPSTREAM_BRANCH: main
+        run: |
+          git clone --depth 1 \
+            --branch "$UPSTREAM_BRANCH" \
+            "https://github.com/${UPSTREAM_REPO}.git" \
+            "$RUNNER_TEMP/omid-upstream"
 
       - name: Apply OMID overlay and sync source tree
         id: sync
-        run: python3 .omid/scripts/sync_upstream.py --upstream "$RUNNER_TEMP/omid-upstream" --repo "$GITHUB_WORKSPACE" --github-output "$GITHUB_OUTPUT"
+        run: |
+          python3 .omid/scripts/sync_upstream.py \
+            --upstream "$RUNNER_TEMP/omid-upstream" \
+            --repo "$GITHUB_WORKSPACE" \
+            --github-output "$GITHUB_OUTPUT"
 
       - name: Commit synchronized upstream source
         id: commit
         env:
           UPSTREAM_SHA: ${{ steps.sync.outputs.upstream_sha }}
+        shell: bash
         run: |
           git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
           git add -A
+
           if ! git diff --cached --quiet; then
-            git commit -m "chore(upstream): sync MHSanaei/3x-ui ${UPSTREAM_SHA:0:7}"
+            git commit -m \
+              "chore(upstream): sync Sanaei ${UPSTREAM_SHA:0:7}"
             echo "source_changed=true" >> "$GITHUB_OUTPUT"
           else
-            echo "No source changes to commit."
             echo "source_changed=false" >> "$GITHUB_OUTPUT"
+            echo "No source changes to commit."
           fi
+
           echo "commit_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
@@ -65,7 +94,7 @@ jobs:
         if: github.event_name != 'schedule' || steps.sync.outputs.upstream_changed == 'true' || steps.commit.outputs.source_changed == 'true'
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/omidiran-gaming/omid-3x-ui
+          images: ${{ steps.image.outputs.name }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=ref,event=branch
@@ -83,9 +112,13 @@ jobs:
           labels: |
             ${{ steps.meta.outputs.labels }}
             org.opencontainers.image.revision=${{ steps.commit.outputs.commit_sha }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Push synchronized source after the image builds successfully
+      - name: Push synchronized source after successful image build
         if: steps.commit.outputs.source_changed == 'true'
-        run: git push origin "HEAD:${GITHUB_REF_NAME}"
+        env:
+          TARGET_BRANCH: ${{ github.ref_name }}
+        run: |
+          git push origin "HEAD:${TARGET_BRANCH}"
