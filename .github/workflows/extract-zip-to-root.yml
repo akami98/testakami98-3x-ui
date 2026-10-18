@@ -1,0 +1,97 @@
+name: Extract ZIP into repository
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  extract:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Extract source ZIP into repository root
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mapfile -t ZIP_FILES < <(find . -maxdepth 1 -type f -iname '*.zip' -print | sort)
+          if [ "${#ZIP_FILES[@]}" -eq 0 ]; then
+            echo "ERROR: No ZIP file found in the repository root. Upload the ZIP to the root and commit it first."
+            exit 1
+          fi
+          if [ "${#ZIP_FILES[@]}" -ne 1 ]; then
+            echo "ERROR: Found more than one ZIP file in the repository root. Keep only the ZIP you want to extract, then rerun this workflow."
+            printf 'Found: %s\n' "${ZIP_FILES[@]}"
+            exit 1
+          fi
+
+          ZIP_FILE="${ZIP_FILES[0]}"
+          EXTRACT_DIR="$RUNNER_TEMP/source-zip"
+          rm -rf "$EXTRACT_DIR"
+          mkdir -p "$EXTRACT_DIR"
+          unzip -q "$ZIP_FILE" -d "$EXTRACT_DIR"
+
+          # If the ZIP has exactly one top-level folder (for example 3x-ui-main/), use that folder.
+          shopt -s dotglob nullglob
+          TOP_LEVEL=("$EXTRACT_DIR"/*)
+          SOURCE_DIR="$EXTRACT_DIR"
+          if [ "${#TOP_LEVEL[@]}" -eq 1 ] && [ -d "${TOP_LEVEL[0]}" ]; then
+            SOURCE_DIR="${TOP_LEVEL[0]}"
+          fi
+
+          # Safety check: this workflow is intended for a source tree, not an arbitrary ZIP.
+          if [ ! -f "$SOURCE_DIR/go.mod" ] || [ ! -d "$SOURCE_DIR/frontend" ]; then
+            echo "ERROR: The ZIP does not look like the 3X-UI source tree (go.mod and frontend/ were not found at its root)."
+            echo "ZIP contents were not copied into the repository."
+            exit 1
+          fi
+
+          # Copy hidden and regular files, while preserving this repository's Git metadata
+          # and this extractor workflow. Upstream .github workflows are intentionally skipped.
+          for ITEM in "$SOURCE_DIR"/*; do
+            [ -e "$ITEM" ] || [ -L "$ITEM" ] || continue
+            NAME="$(basename "$ITEM")"
+            case "$NAME" in
+              .git|.github) continue ;;
+            esac
+            cp -a "$ITEM" .
+          done
+
+          # The initial extractor intentionally skips .github to avoid replacing
+          # workflows by accident. For this maintained source package, update only
+          # the build/publish and extractor workflows from the archive explicitly.
+          if [ -d "$SOURCE_DIR/.github/workflows" ]; then
+            mkdir -p .github/workflows
+            for WORKFLOW in build-publish-image.yml extract-zip-to-root.yml; do
+              if [ -f "$SOURCE_DIR/.github/workflows/$WORKFLOW" ]; then
+                cp -f "$SOURCE_DIR/.github/workflows/$WORKFLOW" ".github/workflows/$WORKFLOW"
+              fi
+            done
+          fi
+
+          # Remove the uploaded archive after extraction so it is not included in the project.
+          rm -f "$ZIP_FILE"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit after extraction."
+            exit 0
+          fi
+
+          git commit -m "Extract 3X-UI source ZIP into repository root"
+          git push
+
+      - name: Trigger upstream sync and image build
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run build-publish-image.yml --ref "${GITHUB_REF_NAME}"

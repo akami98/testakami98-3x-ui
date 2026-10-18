@@ -1,0 +1,91 @@
+name: Sync Sanaei upstream and publish OMID image
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: omid-upstream-sync-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  sync-and-build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout OMID repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Checkout latest Sanaei source
+        run: git clone --depth 1 --branch main https://github.com/MHSanaei/3x-ui.git "$RUNNER_TEMP/omid-upstream"
+
+      - name: Apply OMID overlay and sync source tree
+        id: sync
+        run: python3 .omid/scripts/sync_upstream.py --upstream "$RUNNER_TEMP/omid-upstream" --repo "$GITHUB_WORKSPACE" --github-output "$GITHUB_OUTPUT"
+
+      - name: Commit synchronized upstream source
+        id: commit
+        env:
+          UPSTREAM_SHA: ${{ steps.sync.outputs.upstream_sha }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(upstream): sync MHSanaei/3x-ui ${UPSTREAM_SHA:0:7}"
+            echo "source_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No source changes to commit."
+            echo "source_changed=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "commit_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        if: github.event_name != 'schedule' || steps.sync.outputs.upstream_changed == 'true' || steps.commit.outputs.source_changed == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name != 'schedule' || steps.sync.outputs.upstream_changed == 'true' || steps.commit.outputs.source_changed == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate image metadata
+        id: meta
+        if: github.event_name != 'schedule' || steps.sync.outputs.upstream_changed == 'true' || steps.commit.outputs.source_changed == 'true'
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/omidiran-gaming/omid-3x-ui
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch
+            type=raw,value=upstream-${{ steps.sync.outputs.upstream_sha }}
+
+      - name: Build and publish updated OMID image
+        if: github.event_name != 'schedule' || steps.sync.outputs.upstream_changed == 'true' || steps.commit.outputs.source_changed == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            org.opencontainers.image.revision=${{ steps.commit.outputs.commit_sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Push synchronized source after the image builds successfully
+        if: steps.commit.outputs.source_changed == 'true'
+        run: git push origin "HEAD:${GITHUB_REF_NAME}"
