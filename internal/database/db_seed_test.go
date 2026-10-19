@@ -9,12 +9,8 @@ import (
 	"github.com/mhsanaei/3x-ui/v3/internal/database/model"
 )
 
-func TestInitDB_SeedsStableSubscriptionPaths(t *testing.T) {
-	want := map[string]string{
-		"subPath":      "/sub/",
-		"subJsonPath":  "/json/",
-		"subClashPath": "/clash/",
-	}
+func TestInitDB_GeneratesPerPanelSubscriptionPaths(t *testing.T) {
+	pathPattern := regexp.MustCompile(`^/[0-9a-z]{16}/$`)
 	loadPaths := func(dbPath string) map[string]string {
 		t.Helper()
 		if err := InitDB(dbPath); err != nil {
@@ -26,91 +22,38 @@ func TestInitDB_SeedsStableSubscriptionPaths(t *testing.T) {
 			}
 		}()
 
-		paths := make(map[string]string, len(want))
-		for key, expected := range want {
+		keys := []string{"subPath", "subJsonPath", "subClashPath"}
+		paths := make(map[string]string, len(keys))
+		for _, key := range keys {
 			var setting model.Setting
 			if err := db.Where("key = ?", key).First(&setting).Error; err != nil {
 				t.Fatalf("read %s: %v", key, err)
 			}
-			if setting.Value != expected {
-				t.Fatalf("%s = %q, want %q", key, setting.Value, expected)
+			if !pathPattern.MatchString(setting.Value) {
+				t.Fatalf("%s = %q, want /<16 lowercase alphanumeric characters>/", key, setting.Value)
 			}
 			paths[key] = setting.Value
+		}
+		if paths["subPath"] == paths["subJsonPath"] || paths["subPath"] == paths["subClashPath"] || paths["subJsonPath"] == paths["subClashPath"] {
+			t.Fatalf("subscription paths must be distinct: %v", paths)
 		}
 		return paths
 	}
 
-	dbPath := filepath.Join(t.TempDir(), "x-ui.db")
-	first := loadPaths(dbPath)
-	reloaded := loadPaths(dbPath)
-	for key, value := range first {
-		if value != reloaded[key] {
-			t.Fatalf("%s changed after restart: %q, then %q", key, value, reloaded[key])
+	firstDB := filepath.Join(t.TempDir(), "x-ui.db")
+	first := loadPaths(firstDB)
+	reloaded := loadPaths(firstDB)
+	for key, firstPath := range first {
+		if firstPath != reloaded[key] {
+			t.Fatalf("%s changed after restart: %q, then %q", key, firstPath, reloaded[key])
 		}
 	}
+
 	second := loadPaths(filepath.Join(t.TempDir(), "x-ui.db"))
-	for key, value := range first {
-		if value != second[key] {
-			t.Fatalf("%s differs across panels: %q vs %q", key, value, second[key])
+	for key, firstPath := range first {
+		if firstPath == second[key] {
+			t.Fatalf("%s reused across panels: %q", key, firstPath)
 		}
-	}
-}
-
-func TestInitDB_MigratesLegacySubscriptionPathsInLucityMode(t *testing.T) {
-	t.Setenv("XUI_SUB_PUBLIC_HTTPS", "true")
-	dbPath := filepath.Join(t.TempDir(), "x-ui.db")
-	if err := InitDB(dbPath); err != nil {
-		t.Fatalf("initial InitDB failed: %v", err)
-	}
-	legacy := map[string]string{
-		"subPath":      "/abcde12345fgh678/",
-		"subJsonPath":  "/Json/",
-		"subClashPath": "/vwxyz12345abcd67/",
-	}
-	for key, value := range legacy {
-		if err := db.Model(&model.Setting{}).Where("key = ?", key).Update("value", value).Error; err != nil {
-			t.Fatalf("set legacy %s: %v", key, err)
-		}
-	}
-	if err := CloseDB(); err != nil {
-		t.Fatalf("CloseDB: %v", err)
-	}
-
-	if err := InitDB(dbPath); err != nil {
-		t.Fatalf("reopen InitDB failed: %v", err)
-	}
-	t.Cleanup(func() { _ = CloseDB() })
-	want := map[string]string{
-		"subPath":      "/sub/",
-		"subJsonPath":  "/json/",
-		"subClashPath": "/clash/",
-	}
-	for key, expected := range want {
-		var setting model.Setting
-		if err := db.Where("key = ?", key).First(&setting).Error; err != nil {
-			t.Fatalf("read %s: %v", key, err)
-		}
-		if setting.Value != expected {
-			t.Errorf("%s = %q, want %q", key, setting.Value, expected)
-		}
-	}
-
-	// Deliberately custom paths are not treated as legacy-generated defaults.
-	if err := db.Model(&model.Setting{}).Where("key = ?", "subPath").Update("value", "/my-private-route/").Error; err != nil {
-		t.Fatalf("set custom path: %v", err)
-	}
-	if err := CloseDB(); err != nil {
-		t.Fatalf("CloseDB before custom-path restart: %v", err)
-	}
-	if err := InitDB(dbPath); err != nil {
-		t.Fatalf("reopen after custom path failed: %v", err)
-	}
-	var custom model.Setting
-	if err := db.Where("key = ?", "subPath").First(&custom).Error; err != nil {
-		t.Fatalf("read custom path: %v", err)
-	}
-	if custom.Value != "/my-private-route/" {
-		t.Fatalf("custom subPath = %q, want it preserved", custom.Value)
 	}
 }
 

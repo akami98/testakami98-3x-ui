@@ -181,6 +181,12 @@ func initModels() error {
 	if err := migrateShadowsocksRemovedCiphers(); err != nil {
 		return err
 	}
+	if err := migrateShadowsocks2022ChachaInbounds(); err != nil {
+		return err
+	}
+	if err := repairShadowsocks2022ServerKeys(); err != nil {
+		return err
+	}
 	if err := migrateVmessRemovedSecurities(); err != nil {
 		return err
 	}
@@ -423,6 +429,19 @@ func migrateHostVerifyPeerCertByNameColumn() error {
 	}
 
 	return db.Exec(`UPDATE hosts SET verify_peer_cert_by_name = '' WHERE verify_peer_cert_by_name IS NULL OR typeof(verify_peer_cert_by_name) <> 'text'`).Error
+}
+
+// AutoMigrate casts the boolean-era column to text before the migration above runs,
+// so a saved false/true reads back as the cert name "0"/"false"/"1"/"true".
+func blankLegacyBoolVerifyPeerCertByName() error {
+	return db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(&model.Host{}).
+			Where("verify_peer_cert_by_name IN ?", []string{"0", "1", "false", "true"}).
+			Update("verify_peer_cert_by_name", "").Error; err != nil {
+			return err
+		}
+		return tx.Create(&model.HistoryOfSeeders{SeederName: "HostVerifyPeerCertByNameBoolFix"}).Error
+	})
 }
 
 func seedHostsFromExternalProxy() error {
@@ -987,6 +1006,67 @@ func migrateShadowsocksRemovedCiphers() error {
 	return nil
 }
 
+// migrateShadowsocks2022ChachaInbounds moves 2022-chacha20 inbounds, which the core
+// refuses with users, to aes-256-gcm: same 32-byte keys, so all keys stay valid.
+func migrateShadowsocks2022ChachaInbounds() error {
+	var inbounds []model.Inbound
+	if err := db.Where("protocol = ?", model.Shadowsocks).Find(&inbounds).Error; err != nil {
+		return err
+	}
+	for _, inbound := range inbounds {
+		var settings map[string]any
+		if json.Unmarshal([]byte(inbound.Settings), &settings) != nil {
+			continue
+		}
+		method, _ := settings["method"].(string)
+		if !xray.Shadowsocks2022NoMultiUser(method) {
+			continue
+		}
+		settings["method"] = "2022-blake3-aes-256-gcm"
+		newSettings, err := json.MarshalIndent(settings, "", "  ")
+		if err != nil {
+			return err
+		}
+		if err := db.Model(&model.Inbound{}).Where("id = ?", inbound.Id).
+			Update("settings", string(newSettings)).Error; err != nil {
+			return err
+		}
+		log.Printf("Inbound %q: switched %s to 2022-blake3-aes-256-gcm; its share links changed", inbound.Tag, method)
+	}
+	return nil
+}
+
+// repairShadowsocks2022ServerKeys replaces a stored server key xray-core cannot
+// parse; that inbound never worked, as the core refuses to start with it.
+func repairShadowsocks2022ServerKeys() error {
+	var inbounds []model.Inbound
+	if err := db.Where("protocol = ?", model.Shadowsocks).Find(&inbounds).Error; err != nil {
+		return err
+	}
+	for _, inbound := range inbounds {
+		var settings map[string]any
+		if json.Unmarshal([]byte(inbound.Settings), &settings) != nil {
+			continue
+		}
+		method, _ := settings["method"].(string)
+		n := xray.Shadowsocks2022KeyBytes(method)
+		if key, _ := settings["password"].(string); n == 0 || xray.ValidShadowsocks2022Key(method, key) {
+			continue
+		}
+		settings["password"] = random.Base64Bytes(n)
+		newSettings, err := json.MarshalIndent(settings, "", "  ")
+		if err != nil {
+			return err
+		}
+		if err := db.Model(&model.Inbound{}).Where("id = ?", inbound.Id).
+			Update("settings", string(newSettings)).Error; err != nil {
+			return err
+		}
+		log.Printf("Inbound %q: replaced a %s server key of the wrong size; its share links changed", inbound.Tag, method)
+	}
+	return nil
+}
+
 // migrateVmessRemovedSecurities rewrites the vmess "none"/"zero" security
 // values that xray-core v26.7.11 removed to "auto" (what the core now treats
 // them as), on both the clients column and each vmess inbound's settings.
@@ -1274,7 +1354,7 @@ func seedDefaultSubscriptionPaths() error {
 	})
 }
 
-// OMID OVERLAY: migrate legacy random subscription routes to the public Nginx routes.
+// OMID OVERLAY: migrate legacy randomized routes to the fixed public Nginx routes.
 func isLegacyRandomSubscriptionPath(value string) bool {
 	if len(value) != 18 || value[0] != '/' || value[len(value)-1] != '/' {
 		return false
@@ -1291,7 +1371,11 @@ func migrateLegacyLucitySubscriptionPaths() error {
 	if os.Getenv("XUI_SUB_PUBLIC_HTTPS") != "true" {
 		return nil
 	}
-	defaults := map[string]string{"subPath": "/sub/", "subJsonPath": "/json/", "subClashPath": "/clash/"}
+	defaults := map[string]string{
+		"subPath":      "/sub/",
+		"subJsonPath":  "/json/",
+		"subClashPath": "/clash/",
+	}
 	return db.Transaction(func(tx *gorm.DB) error {
 		for key, target := range defaults {
 			var setting model.Setting
@@ -1311,6 +1395,7 @@ func migrateLegacyLucitySubscriptionPaths() error {
 		return nil
 	})
 }
+
 func runSeeders(isUsersEmpty bool) error {
 	empty, err := isTableEmpty("history_of_seeders")
 	if err != nil {
@@ -1319,7 +1404,7 @@ func runSeeders(isUsersEmpty bool) error {
 	}
 
 	if empty && isUsersEmpty {
-		seeders := []string{"UserPasswordHash", "ClientsTable", "InboundClientsArrayFix", "InboundClientTgIdFix2", "InboundClientSubIdFix", "FreedomFinalRulesReverseFix", "FreedomFinalRulesPrivateEgressBlock", "UppercaseFreedomFinalRulesFix", "InboundRealityFinalmaskTcpStrip", "ApiTokensHash", "LegacyProxySettingsCleanup", "OutboundRemovedKeysFix", "FreedomDomainStrategyFix", "DNSOutboundLegacyKeysFix", "DNSOutboundQTypeZeroFix", "WireguardDomainStrategyFix", "XdnsFinalmaskNamesAddrsFix", "UDPHopClientMaskFix", "WireguardPeersToClients", "MtprotoSecretsToClients", "NodeInboundsAdopted", "ResetIpLimitNoFail2ban"}
+		seeders := []string{"UserPasswordHash", "ClientsTable", "InboundClientsArrayFix", "InboundClientTgIdFix2", "InboundClientSubIdFix", "FreedomFinalRulesReverseFix", "FreedomFinalRulesPrivateEgressBlock", "UppercaseFreedomFinalRulesFix", "InboundRealityFinalmaskTcpStrip", "ApiTokensHash", "LegacyProxySettingsCleanup", "OutboundRemovedKeysFix", "FreedomDomainStrategyFix", "DNSOutboundLegacyKeysFix", "DNSOutboundQTypeZeroFix", "WireguardDomainStrategyFix", "XdnsFinalmaskNamesAddrsFix", "UDPHopClientMaskFix", "HostVerifyPeerCertByNameBoolFix", "WireguardPeersToClients", "MtprotoSecretsToClients", "NodeInboundsAdopted", "ResetIpLimitNoFail2ban"}
 		for _, name := range seeders {
 			if err := db.Create(&model.HistoryOfSeeders{SeederName: name}).Error; err != nil {
 				return err
@@ -1468,6 +1553,12 @@ func runSeeders(isUsersEmpty bool) error {
 
 	if !slices.Contains(seedersHistory, "UDPHopClientMaskFix") {
 		if err := migrateUDPHopClientMasks(); err != nil {
+			return err
+		}
+	}
+
+	if !slices.Contains(seedersHistory, "HostVerifyPeerCertByNameBoolFix") {
+		if err := blankLegacyBoolVerifyPeerCertByName(); err != nil {
 			return err
 		}
 	}
@@ -3096,6 +3187,7 @@ func InitDB(dbPath string) error {
 			return err
 		}
 	}
+
 	if err := migrateLegacyLucitySubscriptionPaths(); err != nil {
 		return err
 	}

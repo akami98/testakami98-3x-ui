@@ -24,6 +24,7 @@ import (
 	"github.com/mhsanaei/3x-ui/v3/internal/logger"
 	"github.com/mhsanaei/3x-ui/v3/internal/tuic"
 	"github.com/mhsanaei/3x-ui/v3/internal/util/common"
+	"github.com/mhsanaei/3x-ui/v3/internal/util/maskcompat"
 	"github.com/mhsanaei/3x-ui/v3/internal/util/random"
 	wgutil "github.com/mhsanaei/3x-ui/v3/internal/util/wireguard"
 	"github.com/mhsanaei/3x-ui/v3/internal/web/service"
@@ -816,11 +817,8 @@ func mergeStreamFromMaster(childStream, masterStream string) string {
 	return string(out)
 }
 
-// GetLink dispatches to the protocol-specific generator for one (inbound, client)
-// pair. Returns "" when the inbound's protocol doesn't produce a subscription URL
-// (socks, http, mixed, wireguard, dokodemo, tunnel) or its transport has no link
-// format (xdrive). The returned string may contain multiple `\n`-separated URLs
-// when the inbound has externalProxy set.
+// GetLink returns one (inbound, client) pair's links, `\n`-separated per externalProxy;
+// "" for a protocol (socks, http, mixed, wireguard, tunnel) or transport (xdrive) without one.
 func (s *SubService) GetLink(inbound *model.Inbound, email string) string {
 	if network, _ := unmarshalStreamSettings(inbound.StreamSettings)["network"].(string); network == "xdrive" {
 		return ""
@@ -1195,21 +1193,22 @@ func vlessEncryptionEnabled(settings map[string]any) bool {
 	return false
 }
 
-// vlessFlowAllowed reports whether a client's XTLS Vision flow belongs in
-// generated links/configs. Mirrors inboundCanEnableTlsFlow in
-// internal/web/service: Vision runs on TCP with tls/reality (classic), and on
-// XHTTP whenever VLESS encryption (vlessenc / ML-KEM) is enabled — there the
-// VLESS-level encryption stands in for the transport TLS that Vision relies
-// on, regardless of the stream security layer (so XHTTP+REALITY+vlessenc
-// keeps its flow too).
-func vlessFlowAllowed(network, security string, settings map[string]any) bool {
-	switch network {
-	case "tcp":
-		return security == "tls" || security == "reality"
-	case "xhttp":
-		return vlessEncryptionEnabled(settings)
+// vlessClientEncryption reads the client-side VLESS encryption from inbound settings. Inbounds
+// stored without the field (older panels, API adds) mean "none", as the frontend schema does.
+func vlessClientEncryption(settings map[string]any) string {
+	if encryption, _ := settings["encryption"].(string); encryption != "" {
+		return encryption
 	}
-	return false
+	return "none"
+}
+
+// vlessFlowAllowed mirrors inboundCanEnableTlsFlow in internal/web/service: Vision runs over
+// TLS/REALITY on raw TCP, or inside VLESS encryption on any transport.
+func vlessFlowAllowed(network, security string, settings map[string]any) bool {
+	if network == "tcp" && (security == "tls" || security == "reality") {
+		return true
+	}
+	return vlessEncryptionEnabled(settings)
 }
 
 func (s *SubService) genVlessLink(inbound *model.Inbound, email string) string {
@@ -1228,11 +1227,8 @@ func (s *SubService) genVlessLink(inbound *model.Inbound, email string) string {
 	params := make(map[string]string)
 	params["type"] = streamNetwork
 
-	// Add encryption parameter for VLESS from inbound settings
 	settings := s.linkSettings(inbound)
-	if encryption, ok := settings["encryption"].(string); ok {
-		params["encryption"] = encryption
-	}
+	params["encryption"] = vlessClientEncryption(settings)
 
 	applyShareNetworkParams(stream, streamNetwork, params)
 	if finalmask, ok := stream["finalmask"].(map[string]any); ok {
@@ -2858,6 +2854,7 @@ func applyFinalMaskObj(finalmask map[string]any, obj map[string]any) {
 
 func marshalFinalMask(finalmask map[string]any) (string, bool) {
 	normalized := withLegacyFragmentRanges(normalizeFinalMask(finalmask))
+	maskcompat.NormalizeUDPHop(normalized)
 	if !hasFinalMaskContent(normalized) {
 		return "", false
 	}

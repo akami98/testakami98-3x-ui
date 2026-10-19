@@ -1673,6 +1673,9 @@ func (s *SettingService) UpdateAllSetting(allSetting *entity.AllSetting, clears 
 	if err := validateSubJsonDnsSetting(allSetting); err != nil {
 		return err
 	}
+	if err := validateFinalMaskJSONSalamander(allSetting.SubJsonFinalMask); err != nil {
+		return err
+	}
 	if err := allSetting.CheckValid(); err != nil {
 		return err
 	}
@@ -1914,27 +1917,22 @@ func (s *SettingService) BuildSubURIBase(host string) string {
 	subDomain, _ := s.GetSubDomain()
 	subKeyFile, _ := s.GetSubKeyFile()
 	subCertFile, _ := s.GetSubCertFile()
-
 	subTLS := subKeyFile != "" && subCertFile != ""
-
 	if subDomain == "" {
 		subDomain = extractHostname(host)
 	}
 
-	// Lucity terminates public HTTPS and forwards requests internally.
+	// OMID OVERLAY: public HTTPS terminates at the platform proxy.
 	if os.Getenv("XUI_SUB_PUBLIC_HTTPS") == "true" {
 		return "https://" + subDomain
 	}
-
 	scheme := "http"
 	if subTLS {
 		scheme = "https"
 	}
-
 	if (subPort == 443 && subTLS) || (subPort == 80 && !subTLS) {
 		return scheme + "://" + subDomain
 	}
-
 	return fmt.Sprintf("%s://%s:%d", scheme, subDomain, subPort)
 }
 
