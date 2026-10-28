@@ -207,13 +207,62 @@ func migrateLegacyLucitySubscriptionPaths() error {
     if init_start < 0:
         fail("db.go changed: InitDB() not found")
     if "migrateLegacyLucitySubscriptionPaths()" not in text[init_start:]:
-        needle = "\tif err := initUser(); err != nil {"
-        inserted = "\tif err := migrateLegacyLucitySubscriptionPaths(); err != nil {\n\t\treturn err\n\t}\n\n" + needle
-        text = replace_once(text, needle, inserted, "db.go migration call")
+        migration_call = (
+            "\tif err := migrateLegacyLucitySubscriptionPaths(); err != nil {\n"
+            "\t\treturn err\n"
+            "\t}\n\n"
+        )
+        # Sanaei v3.11 moved first-user creation out of InitDB into
+        # database.EnsureFirstUser(), called from main.go. The stable point
+        # common to old and new InitDB implementations is immediately before
+        # runSeeders; retain the legacy initUser anchor as a fallback.
+        seeders_return = "\treturn runSeeders(isUsersEmpty)"
+        if text.count(seeders_return) == 1:
+            text = text.replace(seeders_return, migration_call + seeders_return, 1)
+        elif text.count(seeders_return) > 1:
+            fail("db.go migration call: multiple runSeeders return anchors found")
+        else:
+            legacy_init_user = "\tif err := initUser(); err != nil {"
+            text = replace_once(
+                text,
+                legacy_init_user,
+                migration_call + legacy_init_user,
+                "db.go migration call",
+            )
 
     if "random." not in text:
         text = re.sub(r'(?m)^\s*"github.com/mhsanaei/3x-ui/v3/internal/util/random"\n', "", text)
     path.write_text(text)
+
+def patch_dockerinit(repo: Path) -> None:
+    """Make the mtg release lookup resilient to a transient GitHub API failure."""
+    path = repo / "DockerInit.sh"
+    text = path.read_text()
+    marker = "# OMID OVERLAY: robust mtg-multi release resolution"
+    if marker in text:
+        return
+
+    old = """MTG_MULTI_VER=$(curl -sfL "https://api.github.com/repos/mhsanaei/mtg-multi/releases/latest" | sed -n 's/.*"tag_name": *"\\([^\"]*\\)".*/\\1/p' | head -n 1)
+if [ -z "$MTG_MULTI_VER" ]; then
+    echo "DockerInit: could not resolve the latest mtg-multi release tag" >&2
+    exit 1
+fi"""
+    new = """# OMID OVERLAY: robust mtg-multi release resolution
+# MTG_MULTI_VER may be pinned by the build environment. If GitHub's API is
+# temporarily unreachable or rate-limited, use a known published release.
+MTG_MULTI_VER="${MTG_MULTI_VER:-}"
+if [ -z "$MTG_MULTI_VER" ]; then
+    MTG_MULTI_VER=$(curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 10 \\
+        "https://api.github.com/repos/mhsanaei/mtg-multi/releases/latest" \\
+        2>/dev/null | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\\([^\"]*\\)".*/\\1/p' | head -n 1)
+fi
+if [ -z "$MTG_MULTI_VER" ]; then
+    echo "DockerInit: GitHub API unavailable; using fallback mtg-multi v1.16.0" >&2
+    MTG_MULTI_VER="v1.16.0"
+fi"""
+    text = replace_once(text, old, new, "DockerInit.sh mtg-multi release lookup")
+    path.write_text(text)
+
 
 def patch_setting_service(repo: Path) -> None:
     path = repo / "internal/web/service/setting.go"
@@ -304,6 +353,7 @@ def main() -> None:
     patch_entrypoint(repo)
     patch_dockerfile(repo)
     patch_database(repo)
+    patch_dockerinit(repo)
     patch_setting_service(repo)
     patch_telegram_urls(repo)
 
